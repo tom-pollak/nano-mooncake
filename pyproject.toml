@@ -1,0 +1,14 @@
+[project]
+name = "nano-mooncake"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "iris",
+    "torch>=2.8.0",
+    "triton>=3.4.0",
+]
+
+[tool.uv.sources]
+iris = { git = "https://github.com/ROCm/iris.git" }
