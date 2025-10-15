@@ -97,9 +97,11 @@ def run_bench(rank: int, world_size: int, args):
                   f"copy={avg_copy_ms:.2f} ms ({copy_gibs:.2f} GiB/s)  "
                   f"end2end p50={p50_ms:.2f} ms p99={p99_ms:.2f} ms")
 
+        # Ensure producer has completed all PUTs before consumer reads
+        dist.barrier()
+
         if rank == consumer:
             # one GET to sample read throughput
-            dist.barrier()
             y = cache.get(key_prefix + "-warm")
             t0 = time.perf_counter()
             _ = cache.get(f"{key_prefix}-0")
