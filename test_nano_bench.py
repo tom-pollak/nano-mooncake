@@ -55,13 +55,17 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
     backend = "nccl"
     torch.cuda.set_device(local_rank)
     print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
-    dist.init_process_group(
+    # Torch distributed init (optionally pass device_id if supported)
+    init_kwargs = dict(
         backend=backend,
         init_method=init_url,
         world_size=world_size,
         rank=local_rank,
         timeout=timedelta(seconds=120),
+        device_id=torch.device(f'cuda:{local_rank}'),
     )
+    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
+    dist.init_process_group(**init_kwargs)
 
     # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
     # You can bump this with --heap_mb.
@@ -146,9 +150,16 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
 
 if __name__ == "__main__":
     args = parse_args()
-    # Prefer torchrun; but for mp.spawn pick a free-ish port
-    url = "tcp://127.0.0.1:29500"
-    mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
-    args = parse_args()
-    url = "tcp://127.0.0.1:29500"
-    mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
+    # Build init URL from env if provided (torchrun), else default
+    master_addr = os.getenv('MASTER_ADDR', '127.0.0.1')
+    master_port = os.getenv('MASTER_PORT', '29500')
+    url = f"tcp://{master_addr}:{master_port}"
+
+    # If launched via torchrun, LOCAL_RANK/WORLD_SIZE are set and we should NOT mp.spawn again
+    local_rank_env = os.getenv('LOCAL_RANK')
+    world_size_env = os.getenv('WORLD_SIZE')
+    if local_rank_env is not None and world_size_env is not None:
+        _worker(int(local_rank_env), int(world_size_env), url, args)
+    else:
+        # Fallback: single-process launcher spawns N workers
+        mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
