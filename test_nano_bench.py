@@ -33,18 +33,44 @@ def torch_dtype(name: str):
 
 
 def _worker(local_rank: int, world_size: int, init_url: str, args):
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    # ---- Robust distributed + env setup ----
+    from datetime import timedelta
+    # Parse master addr/port from init_url like tcp://127.0.0.1:29500
+    url_body = init_url.split("//", 1)[1]
+    master_addr, master_port = url_body.split(":")
+    os.environ.setdefault("MASTER_ADDR", master_addr)
+    os.environ.setdefault("MASTER_PORT", master_port)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    # Sometimes IRIS reads these; set them too just in case
+    os.environ["IRIS_RANK"] = str(local_rank)
+    os.environ["IRIS_WORLD_SIZE"] = str(world_size)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for Nano Mooncake MVP (GPU-only). No CUDA device detected.")
+    n_gpus = torch.cuda.device_count()
+    if world_size > n_gpus:
+        raise RuntimeError(f"world_size={world_size} exceeds visible GPUs={n_gpus}. Use --world_size<={n_gpus} or set CUDA_VISIBLE_DEVICES.")
+
+    backend = "nccl"
+    torch.cuda.set_device(local_rank)
+    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
     dist.init_process_group(
         backend=backend,
         init_method=init_url,
         world_size=world_size,
         rank=local_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=timedelta(seconds=120),
     )
 
-    torch.cuda.set_device(local_rank)
-
-    shmem = iris.iris(1 << 33)  # 8 GiB default symmetric heap (adjust as needed)
+    # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
+    # You can bump this with --heap_mb.
+    # 1 GiB symmetric heap baseline (adjust per GPU mem)
+    iris_heap_bytes = 1 << 30
+    try:
+        shmem = iris.iris(iris_heap_bytes)
+    except Exception as e:
+        raise RuntimeError(f"IRIS init failed (heap={iris_heap_bytes}): {e}")
 
     dtype = torch_dtype(args.dtype)
     elem_bytes = torch.tensor([], dtype=dtype, device="cuda").element_size()
@@ -61,38 +87,29 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
     rank = shmem.get_rank()
     ws = shmem.get_num_ranks()
 
-    # Sanity
+    # Sanity: IRIS ranks should match torch world_size
     if ws != world_size:
-        raise RuntimeError("IRIS world size mismatch vs torch.distributed")
+        raise RuntimeError(f"IRIS world size mismatch vs torch.distributed (iris={ws}, torch={world_size}). Ensure RANK/WORLD_SIZE env are set.")
 
     # Simple correctness once
     key = f"kv-{time.time_ns()}"
     n_elems = (args.elem_mb * 1024 * 1024) // elem_bytes
 
-    # Source payload on producer (rank 0)
     if rank == 0:
         src = torch.arange(n_elems, dtype=dtype, device="cuda")
         cache.put(key, src, preferred_segment=1 if world_size > 1 else 0)
-    else:
-        # non-producer waits
-        pass
-
     dist.barrier()
 
-    # Consumer reads (owner is preferred_segment=1)
     if world_size > 1 and rank == 1:
         dst = torch.empty(n_elems, dtype=dtype, device="cuda")
         cache.get_into(key, dst)
-        # Validate
         src_cpu = torch.arange(n_elems, dtype=dtype, device="cpu")
         assert torch.allclose(dst.cpu(), src_cpu), "Mismatch in GET data"
-
     dist.barrier()
 
-    # Benchmark loop: producer pushes, consumer reads
+    # Benchmark loop
     put_times = []
     get_times = []
-
     for it in range(args.iters):
         k = f"bench-{it}-{time.time_ns()}"
         if rank == 0:
@@ -100,28 +117,27 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
             t0 = time.time()
             cache.put(k, src, preferred_segment=1 if world_size > 1 else 0)
             torch.cuda.synchronize()
-            t1 = time.time()
-            put_times.append(t1 - t0)
+            put_times.append(time.time() - t0)
         dist.barrier()
         if world_size > 1 and rank == 1:
             dst = torch.empty(n_elems, dtype=dtype, device="cuda")
             t0 = time.time()
             cache.get_into(k, dst)
             torch.cuda.synchronize()
-            t1 = time.time()
-            get_times.append(t1 - t0)
+            get_times.append(time.time() - t0)
         dist.barrier()
 
     if rank == 0:
         bytes_per = n_elems * elem_bytes
         if put_times:
-            gbps = [(bytes_per / t) / (1024**3) for t in put_times]
-            print(f"PUT: p50={torch.tensor(gbps).median().item():.2f} GiB/s  p90={torch.quantile(torch.tensor(gbps), 0.9).item():.2f}  n={len(gbps)}")
+            gbps = torch.tensor([(bytes_per / t) / (1024**3) for t in put_times])
+            print(f"PUT: p50={gbps.median().item():.2f} GiB/s  p90={torch.quantile(gbps, 0.9).item():.2f}  n={len(gbps)}")
         print("Stats(master):", cache.stats())
     if world_size > 1 and rank == 1:
+        bytes_per = n_elems * elem_bytes
         if get_times:
-            gbps = [(bytes_per / t) / (1024**3) for t in get_times]
-            print(f"GET: p50={torch.tensor(gbps).median().item():.2f} GiB/s  p90={torch.quantile(torch.tensor(gbps), 0.9).item():.2f}  n={len(gbps)}")
+            gbps = torch.tensor([(bytes_per / t) / (1024**3) for t in get_times])
+            print(f"GET: p50={gbps.median().item():.2f} GiB/s  p90={torch.quantile(gbps, 0.9).item():.2f}  n={len(gbps)}")
         print(f"Stats(rank{rank}):", cache.stats())
 
     dist.barrier()
@@ -129,6 +145,10 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    # Prefer torchrun; but for mp.spawn pick a free-ish port
+    url = "tcp://127.0.0.1:29500"
+    mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
     args = parse_args()
     url = "tcp://127.0.0.1:29500"
     mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
