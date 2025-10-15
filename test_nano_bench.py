@@ -184,8 +184,7 @@ if __name__ == "__main__":
     # If launched via torchrun, LOCAL_RANK/WORLD_SIZE are set and we should NOT mp.spawn again
     local_rank_env = os.getenv('LOCAL_RANK')
     world_size_env = os.getenv('WORLD_SIZE')
-    # if local_rank_env is not None and world_size_env is not None:
-    #     _worker(int(local_rank_env), int(world_size_env), url, args)
-    # else:
-    #     # Fallback: single-process launcher spawns N workers
-    mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
+    if local_rank_env is not None and world_size_env is not None:
+        _worker(int(local_rank_env), int(world_size_env), url, args)
+    else:
+        mp.spawn(_worker, args=(args.world_size, url, args), nprocs=args.world_size, join=True)
