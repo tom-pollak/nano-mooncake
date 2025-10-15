@@ -185,18 +185,21 @@ class NanoKVCache:
     def _all_gather_one(self, obj: Any) -> list[Any]:
         """Gather a Python object from each rank to master. Others receive empty list."""
         out = [None for _ in range(self.world_size)]
-        kwargs = {"group": self.pg} if self.pg is not None else {}
-        # Force CPU device for object collectives to avoid CUDA OOM issues
-        kwargs["device"] = torch.device("cpu")
-        dist.all_gather_object(out, obj, **kwargs)
+        # Use the provided process group (should be Gloo for CPU-based object collectives)
+        # If no group provided, use default group
+        if self.pg is not None:
+            dist.all_gather_object(out, obj, group=self.pg)
+        else:
+            dist.all_gather_object(out, obj)
         return out
 
     def _broadcast_one(self, obj: Any, src: int) -> Any:
         buf = [obj] if self.rank == src else [None]
-        kwargs = {"group": self.pg} if self.pg is not None else {}
-        # Force CPU device for object collectives to avoid CUDA OOM issues
-        kwargs["device"] = torch.device("cpu")
-        dist.broadcast_object_list(buf, src=src, **kwargs)
+        # Use the provided process group (should be Gloo for CPU-based object collectives)
+        if self.pg is not None:
+            dist.broadcast_object_list(buf, src=src, group=self.pg)
+        else:
+            dist.broadcast_object_list(buf, src=src)
         return buf[0]
 
     # -------------

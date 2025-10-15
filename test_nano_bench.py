@@ -52,40 +52,22 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
     if world_size > n_gpus:
         raise RuntimeError(f"world_size={world_size} exceeds visible GPUs={n_gpus}. Use --world_size<={n_gpus} or set CUDA_VISIBLE_DEVICES.")
 
-    backend = "nccl"
     torch.cuda.set_device(local_rank)
-    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
-    # Torch distributed init (optionally pass device_id if supported)
-    init_kwargs = dict(
-        backend=backend,
+
+    # Initialize NCCL backend first (needed for IRIS)
+    print(f"[Rank {local_rank}] init_process_group with NCCL on {master_addr}:{master_port}", flush=True)
+    dist.init_process_group(
+        backend="nccl",
         init_method=init_url,
         world_size=world_size,
         rank=local_rank,
         timeout=timedelta(seconds=120),
     )
-    try:
-        import inspect
-        if 'device_id' in inspect.signature(dist.init_process_group).parameters:
-            init_kwargs['device_id'] = torch.device(f'cuda:{local_rank}')
-    except Exception:
-        pass
-    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
-    # Torch distributed init (optionally pass device_id if supported)
-    init_kwargs = dict(
-        backend=backend,
-        init_method=init_url,
-        world_size=world_size,
-        rank=local_rank,
-        timeout=timedelta(seconds=120),
-    )
-    try:
-        import inspect
-        if 'device_id' in inspect.signature(dist.init_process_group).parameters:
-            init_kwargs['device_id'] = torch.device(f'cuda:{local_rank}')
-    except Exception:
-        pass
-    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
-    dist.init_process_group(**init_kwargs)
+
+    # Create a Gloo process group for CPU-based object collectives
+    # This avoids CUDA OOM issues with all_gather_object
+    print(f"[Rank {local_rank}] Creating Gloo control plane group", flush=True)
+    ctrl_pg = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
 
     # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
     # You can bump this with --heap_mb.
@@ -106,6 +88,7 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
         dtype=dtype,
         page_bytes=args.page_kb * 1024,
         master_rank=0,
+        ctrl_group=ctrl_pg,
     )
 
     rank = shmem.get_rank()
