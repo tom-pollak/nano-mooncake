@@ -180,27 +180,84 @@ class NanoKVCache:
         # Routing strategy: hash % world_size
 
     # -------------
-    # RPC helpers
+    # Control-plane helpers using simple tensor collectives
     # -------------
-    def _all_gather_one(self, obj: Any) -> list[Any]:
-        """Gather a Python object from each rank to master. Others receive empty list."""
-        out = [None for _ in range(self.world_size)]
-        # Use the provided process group (should be Gloo for CPU-based object collectives)
-        # If no group provided, use default group
-        if self.pg is not None:
-            dist.all_gather_object(out, obj, group=self.pg)
-        else:
-            dist.all_gather_object(out, obj)
-        return out
+    def _encode_message(self, tag: str, payload: Optional[dict[str, Any]]) -> torch.Tensor:
+        """Encode a message into a fixed-size int64 tensor (CPU).
+        Format: [tag_code, dtype_code, from_rank, dst_rank, key_hash, n_elems, header_ptr, payload_ptr, page_elems, ...]
+        """
+        # Tag codes
+        TAG_CODES = {
+            "OPEN_REQ": 1, "OPEN_REQ_MASTER": 2, "ALLOCATE": 3, "PLAN": 4, "PLAN_FINAL": 5,
+            "LOC_REQ": 6, "LOC_RESP": 7, "REM_REQ": 8, "REM_RESP": 9, "REM_DO": 10, "REM_DONE": 11
+        }
+        DTYPE_CODES = {str(torch.float16): 1, str(torch.float32): 2, str(torch.bfloat16): 3}
 
-    def _broadcast_one(self, obj: Any, src: int) -> Any:
-        buf = [obj] if self.rank == src else [None]
-        # Use the provided process group (should be Gloo for CPU-based object collectives)
-        if self.pg is not None:
-            dist.broadcast_object_list(buf, src=src, group=self.pg)
+        msg = torch.zeros(16, dtype=torch.int64, device="cpu")
+        msg[0] = TAG_CODES.get(tag, 0)
+
+        if payload:
+            msg[2] = payload.get("from_rank", -1)
+            msg[3] = payload.get("dst_rank", -1)
+            msg[4] = payload.get("key_hash", 0)
+            msg[5] = payload.get("n_elems", 0)
+            msg[6] = payload.get("header_ptr", 0)
+            msg[7] = payload.get("payload_ptr", 0)
+            msg[8] = payload.get("page_elems", 0)
+            if "dtype" in payload:
+                msg[1] = DTYPE_CODES.get(payload["dtype"], 0)
+
+        return msg
+
+    def _decode_message(self, tensor: torch.Tensor) -> tuple[str, Optional[dict[str, Any]]]:
+        """Decode a message tensor back to (tag, payload)."""
+        TAG_NAMES = {1: "OPEN_REQ", 2: "OPEN_REQ_MASTER", 3: "ALLOCATE", 4: "PLAN", 5: "PLAN_FINAL",
+                     6: "LOC_REQ", 7: "LOC_RESP", 8: "REM_REQ", 9: "REM_RESP", 10: "REM_DO", 11: "REM_DONE"}
+        DTYPE_NAMES = {1: str(torch.float16), 2: str(torch.float32), 3: str(torch.bfloat16)}
+
+        tag_code = int(tensor[0].item())
+        tag = TAG_NAMES.get(tag_code, "UNKNOWN")
+
+        if tag_code == 0:
+            return (tag, None)
+
+        payload = {
+            "from_rank": int(tensor[2].item()),
+            "dst_rank": int(tensor[3].item()),
+            "key_hash": int(tensor[4].item()),
+            "n_elems": int(tensor[5].item()),
+            "header_ptr": int(tensor[6].item()),
+            "payload_ptr": int(tensor[7].item()),
+            "page_elems": int(tensor[8].item()),
+        }
+
+        dtype_code = int(tensor[1].item())
+        if dtype_code > 0:
+            payload["dtype"] = DTYPE_NAMES.get(dtype_code, str(self.dtype))
+
+        # Filter out -1 and 0 values that weren't set
+        payload = {k: v for k, v in payload.items() if v != -1 and (k not in ["key_hash", "n_elems", "header_ptr", "payload_ptr"] or v != 0)}
+
+        return (tag, payload if payload else None)
+
+    def _all_gather_one(self, msg: tuple[str, Optional[dict[str, Any]]]) -> list[tuple[str, Optional[dict[str, Any]]]]:
+        """Gather messages from all ranks using CPU tensors."""
+        tag, payload = msg
+        send_tensor = self._encode_message(tag, payload)
+        recv_tensors = [torch.zeros(16, dtype=torch.int64, device="cpu") for _ in range(self.world_size)]
+        dist.all_gather(recv_tensors, send_tensor)
+        return [self._decode_message(t) for t in recv_tensors]
+
+    def _broadcast_one(self, msg: Optional[tuple[str, Any]], src: int) -> tuple[str, Any]:
+        """Broadcast a message from src rank using CPU tensors."""
+        if self.rank == src and msg is not None:
+            tag, payload = msg
+            send_tensor = self._encode_message(tag, payload)
         else:
-            dist.broadcast_object_list(buf, src=src)
-        return buf[0]
+            send_tensor = torch.zeros(16, dtype=torch.int64, device="cpu")
+
+        dist.broadcast(send_tensor, src=src)
+        return self._decode_message(send_tensor)
 
     # -------------
     # Allocation on OWNER rank (invoked by protocol round 1)

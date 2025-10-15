@@ -64,10 +64,8 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
         timeout=timedelta(seconds=120),
     )
 
-    # Create a Gloo process group for CPU-based object collectives
-    # This avoids CUDA OOM issues with all_gather_object
-    print(f"[Rank {local_rank}] Creating Gloo control plane group", flush=True)
-    ctrl_pg = dist.new_group(backend="gloo", timeout=timedelta(seconds=120))
+    # We'll pass None for ctrl_group and handle object collectives differently
+    ctrl_pg = None
 
     # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
     # You can bump this with --heap_mb.
