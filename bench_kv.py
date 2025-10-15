@@ -43,7 +43,13 @@ def run_bench(rank: int, world_size: int, args):
     torch.cuda.set_device(rank if torch.cuda.is_available() else 0)
 
     # RPC init (tiny control plane)
-    rpc.init_rpc(name=f"worker{rank}", rank=rank, world_size=world_size)
+    rpc_backend_options = rpc.TensorPipeRpcBackendOptions(init_method=args.init)
+    rpc.init_rpc(
+        name=f"worker{rank}",
+        rank=rank,
+        world_size=world_size,
+        rpc_backend_options=rpc_backend_options
+    )
 
     dtype = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16}[args.dtype]
     cache = NanoKVCache(heap_bytes=args.heap_gb * (1 << 30), dtype=dtype, master_rank=0)
