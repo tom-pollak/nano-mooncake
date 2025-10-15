@@ -87,12 +87,6 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
     print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
     dist.init_process_group(**init_kwargs)
 
-    # Create a control-plane group that uses Gloo for object collectives
-    try:
-        ctrl_pg = dist.new_group(backend='gloo')
-    except Exception:
-        ctrl_pg = None
-
     # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
     # You can bump this with --heap_mb.
     # 1 GiB symmetric heap baseline (adjust per GPU mem)

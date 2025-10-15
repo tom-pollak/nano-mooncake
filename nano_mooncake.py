@@ -186,12 +186,16 @@ class NanoKVCache:
         """Gather a Python object from each rank to master. Others receive empty list."""
         out = [None for _ in range(self.world_size)]
         kwargs = {"group": self.pg} if self.pg is not None else {}
+        # Force CPU device for object collectives to avoid CUDA OOM issues
+        kwargs["device"] = torch.device("cpu")
         dist.all_gather_object(out, obj, **kwargs)
         return out
 
     def _broadcast_one(self, obj: Any, src: int) -> Any:
         buf = [obj] if self.rank == src else [None]
         kwargs = {"group": self.pg} if self.pg is not None else {}
+        # Force CPU device for object collectives to avoid CUDA OOM issues
+        kwargs["device"] = torch.device("cpu")
         dist.broadcast_object_list(buf, src=src, **kwargs)
         return buf[0]
 
