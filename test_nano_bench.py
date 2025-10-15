@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 import iris
 
 # Import the cache from sibling file
-from nano_mooncake_mvp import NanoKVCache
+from nano_mooncake import NanoKVCache
 
 
 def parse_args():
