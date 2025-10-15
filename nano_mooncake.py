@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Minimal GPU-only distributed KV cache using IRIS + Triton
 # Single-hop GPU↔GPU writes from inside Triton kernels, tiny rank-0 master.
@@ -145,6 +146,7 @@ class WritePlan:
 # ======================
 
 class NanoKVCache:
+    # ctrl_group: optional torch process group (use Gloo for object collectives)
     def __init__(
         self,
         shmem: iris.iris,
@@ -152,6 +154,7 @@ class NanoKVCache:
         dtype: torch.dtype = torch.float16,
         page_bytes: int = 256 * 1024,
         master_rank: int = 0,
+        ctrl_group=None,
     ) -> None:
         assert dtype in (torch.float16, torch.float32, torch.bfloat16), "MVP supports fp16/fp32/bf16"
         self.shmem = shmem
@@ -162,6 +165,7 @@ class NanoKVCache:
         self.world_size = shmem.get_num_ranks()
         self.rank = shmem.get_rank()
         self.master_rank = master_rank
+        self.pg = ctrl_group  # control-plane process group (Gloo recommended)
 
         # Owner-side payload pool: simple bump allocator
         self.payload_pool = shmem.empty((heap_elems,), device="cuda", dtype=dtype)
@@ -181,12 +185,14 @@ class NanoKVCache:
     def _all_gather_one(self, obj: Any) -> list[Any]:
         """Gather a Python object from each rank to master. Others receive empty list."""
         out = [None for _ in range(self.world_size)]
-        dist.all_gather_object(out, obj)
+        kwargs = {"group": self.pg} if self.pg is not None else {}
+        dist.all_gather_object(out, obj, **kwargs)
         return out
 
     def _broadcast_one(self, obj: Any, src: int) -> Any:
         buf = [obj] if self.rank == src else [None]
-        dist.broadcast_object_list(buf, src=src)
+        kwargs = {"group": self.pg} if self.pg is not None else {}
+        dist.broadcast_object_list(buf, src=src, **kwargs)
         return buf[0]
 
     # -------------

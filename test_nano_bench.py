@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 import iris
 
 # Import the cache from sibling file
-from nano_mooncake import NanoKVCache
+from nano_mooncake_mvp import NanoKVCache
 
 
 def parse_args():
@@ -62,10 +62,36 @@ def _worker(local_rank: int, world_size: int, init_url: str, args):
         world_size=world_size,
         rank=local_rank,
         timeout=timedelta(seconds=120),
-        device_id=torch.device(f'cuda:{local_rank}'),
     )
+    try:
+        import inspect
+        if 'device_id' in inspect.signature(dist.init_process_group).parameters:
+            init_kwargs['device_id'] = torch.device(f'cuda:{local_rank}')
+    except Exception:
+        pass
+    print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
+    # Torch distributed init (optionally pass device_id if supported)
+    init_kwargs = dict(
+        backend=backend,
+        init_method=init_url,
+        world_size=world_size,
+        rank=local_rank,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        import inspect
+        if 'device_id' in inspect.signature(dist.init_process_group).parameters:
+            init_kwargs['device_id'] = torch.device(f'cuda:{local_rank}')
+    except Exception:
+        pass
     print(f"[Rank {local_rank}] init_process_group on {master_addr}:{master_port}", flush=True)
     dist.init_process_group(**init_kwargs)
+
+    # Create a control-plane group that uses Gloo for object collectives
+    try:
+        ctrl_pg = dist.new_group(backend='gloo')
+    except Exception:
+        ctrl_pg = None
 
     # ---- IRIS symmetric heap (use modest default to avoid OOM) ----
     # You can bump this with --heap_mb.
