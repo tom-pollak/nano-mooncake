@@ -61,3 +61,15 @@ class FakeOwner:
             return False
         h.state = DevState.DEAD
         return True
+
+    def reader_enter(self, man: Manifest) -> bool:
+        h = self.headers.get(man.header_ptr)
+        if not h or h.state != DevState.READY or h.epoch != man.epoch:
+            return False
+        h.refcnt += 1
+        return True
+
+    def reader_exit(self, man: Manifest) -> None:
+        h = self.headers.get(man.header_ptr)
+        assert h and h.epoch == man.epoch and h.refcnt > 0
+        h.refcnt -= 1
