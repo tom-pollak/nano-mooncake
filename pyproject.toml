@@ -9,6 +9,7 @@ dependencies = [
     "iris",
     "jupyterlab>=4.4.9",
     "pydantic>=2.12.2",
+    "pytest>=8.4.2",
     "torch>=2.8.0",
     "triton>=3.4.0",
     "xxhash>=3.6.0",
