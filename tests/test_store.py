@@ -1,48 +1,121 @@
-import pytest
-import xxhash
-from nano_mooncake.store import Manifest, open_for_write, commit, get_location, remove
-from nano_mooncake.owner import FakeOwner
+import uuid
 import etcd3
-
-HEAP_BYTES = 1024
-PAGE_BYTES = 8
+import contextlib
+import pytest
+from nano_mooncake.store import Client, Manifest
+from nano_mooncake.owner import FakeOwner, DevHeader, DevState
+import etcd3
 
 
 @pytest.fixture()
 def cli():
-    return etcd3.client()
+    c = etcd3.client()
+    ns = f"/nm_test/{uuid.uuid4().hex}"
+    yield Client(c, ns)
+    # cleanup
+    with contextlib.suppress(Exception):
+        for k, *_ in c.get_prefix(ns):
+            c.delete(k)
 
 
 @pytest.fixture()
 def owner():
-    return FakeOwner(rank=0, heap_bytes=HEAP_BYTES, page_bytes=PAGE_BYTES)
+    return FakeOwner(rank=0, heap_bytes=1024, page_bytes=8)
 
 
 def test_happy_path(cli, owner: FakeOwner):
     key = "sess/1:t8192"
-    h = xxhash.xxh64(key).hexdigest()
     epoch = 1
     man = owner.alloc(key, bytes_total=256, epoch=epoch)
 
-    assert open_for_write(cli, h, man)
+    assert cli.open_for_write(man)
     # simulate producer data copy, then device publish
     owner.publish_ready(man.header_ptr, epoch)
-    assert commit(cli, h)
+    assert cli.commit(man.hash)
 
-    st, got = get_location(cli, h)
+    st, got = cli.get_location(man.hash)
     assert got is not None
     assert st == "READY" and got.header_ptr == man.header_ptr
 
-    assert remove(cli, h, owner)
-    st, _ = get_location(cli, h)
+    assert cli.remove(man.hash, owner)
+    st, _ = cli.get_location(man.hash)
     assert st == "MISSING"
 
 
 def test_double_open_for_write(cli, owner):
     key = "sess/1:t8192"
-    h = xxhash.xxh64(key).hexdigest()
     epoch = 1
     man = owner.alloc(key, bytes_total=256, epoch=epoch)
 
-    assert open_for_write(cli, h, man) is True
-    assert open_for_write(cli, h, man) is False
+    assert cli.open_for_write(man)
+    assert cli.open_for_write(man) is False
+
+
+def test_not_ready(cli, owner):
+    key = "sess/2:t4096"
+    man = owner.alloc(key, bytes_total=128, epoch=1)
+
+    assert cli.open_for_write(man)  # see wrappers below
+    st, got = cli.get_location(man.hash)
+    assert st == "WRITING" and got is None
+
+
+def test_commit_idempotent(cli, owner):
+    key = "sess/3:t4096"
+    man = owner.alloc(key, 256, epoch=1)
+
+    assert cli.open_for_write(man)
+    owner.publish_ready(man.header_ptr, 1)
+    assert cli.commit(man.hash)
+    # second commit should be True and a no-op
+    assert cli.commit(man.hash)
+
+
+def test_epoch_prevents_aba(cli, owner):
+    key = "sess/4:t4096"
+
+    # A1 publish
+    man1 = owner.alloc(key, 256, epoch=1)
+    assert cli.open_for_write(man1)
+    owner.publish_ready(man1.header_ptr, 1)
+    assert cli.commit(man1.hash)
+
+    # Reader caches manifest here (simulated)
+    st, cached = cli.get_location(man1.hash)
+    assert st == "READY" and cached.epoch == 1
+
+    # Remove A1, reuse data for A2
+    assert cli.remove(man1.hash, owner)
+    man2 = Manifest(**{**cached.model_dump(), "epoch": 2})
+    # Force owner to reuse same ptrs in FakeOwner (skip alloc; we're simulating)
+    owner.headers[man2.header_ptr] = DevHeader(
+        epoch=2, state=DevState.WRITING, refcnt=0
+    )
+
+    assert cli.open_for_write(man2)
+    owner.publish_ready(man2.header_ptr, 2)
+    assert cli.commit(man2.hash)
+
+    # A reader must compare header.epoch vs cached.epoch before touching refcnt
+    assert owner.headers[man2.header_ptr].epoch == 2
+    assert cached.epoch == 1
+    # Your real reader should detect mismatch and refetch metadata.
+
+
+def test_remove_idempotent_and_refcnt(cli, owner):
+    key = "sess/5:t4096"
+    man = owner.alloc(key, 128, epoch=1)
+    assert cli.open_for_write(man)
+    owner.publish_ready(man.header_ptr, 1)
+    assert cli.commit(man.hash)
+
+    # simulate in-use
+    owner.headers[man.header_ptr].refcnt = 1
+    assert cli.remove(man.hash, owner) is False  # busy
+    owner.headers[man.header_ptr].refcnt = 0
+    assert cli.remove(man.hash, owner) is True
+    assert cli.remove(man.hash, owner) is True  # second time, no-op
+
+
+def test_open_for_write_lease_ttl():
+    pass

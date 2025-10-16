@@ -1,5 +1,5 @@
 import etcd3
-from .store import Manifest, open_for_write, commit, computed_field
+from .store import Manifest
 
 
 # cli = etcd3.client()
