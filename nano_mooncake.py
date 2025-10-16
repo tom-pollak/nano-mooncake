@@ -179,12 +179,13 @@ class NanoKVCache:
     # RPC helpers
     # -------------
     def _all_gather_one(self, obj: Any) -> list[Any]:
-        """Gather a Python object from each rank to master. Others receive empty list."""
+        """Gather a Python object from each rank."""
         out = [None for _ in range(self.world_size)]
         dist.all_gather_object(out, obj)
         return out
 
     def _broadcast_one(self, obj: Any, src: int) -> Any:
+        """Broadcast a Python object from src rank to all ranks."""
         buf = [obj] if self.rank == src else [None]
         dist.broadcast_object_list(buf, src=src)
         return buf[0]
@@ -192,12 +193,12 @@ class NanoKVCache:
     # -------------
     # Allocation on OWNER rank (invoked by protocol round 1)
     # -------------
-    def _owner_alloc(self, key: str, n_elems: int) -> Tuple[int, int, int]:
+    def _owner_alloc(self, key_hash: int, n_elems: int) -> Tuple[int, int, int]:
         # Return (header_ptr, payload_ptr, page_elems)
         # Create header buffer (symmetric, uint32)
         header = self.shmem.zeros((HEADER_U32_WORDS,), device="cuda", dtype=torch.int32)
         header_ptr = header.data_ptr()
-        self._headers[_hash_key_u64(key)] = header
+        self._headers[key_hash] = header
 
         # Reserve contiguous payload range
         start = self._payload_bump
@@ -225,48 +226,39 @@ class NanoKVCache:
         dst_rank = preferred_segment if preferred_segment is not None else (key_hash % self.world_size)
 
         # Round 1: producer announces request → master chooses owner and asks OWNER to alloc
-        req = None
-        if self.rank == self.master_rank:
-            req = ("OPEN_REQ_MASTER", None)  # dummy placeholder for consistency
-        gathered = self._all_gather_one(("OPEN_REQ", {
+        gathered = self._all_gather_one({
             "from_rank": self.rank,
-            "key": key,
             "key_hash": key_hash,
             "n_elems": n_elems,
-            "dtype": str(self.dtype),
             "dst_rank": dst_rank,
-        }))
+        })
 
         # Master discovers one request per call (MVP assumes single caller at a time)
         if self.rank == self.master_rank:
             producer_req = None
             for item in gathered:
-                if item is None:
-                    continue
-                tag, payload = item
-                if tag == "OPEN_REQ":
-                    producer_req = payload
+                if item is not None:
+                    producer_req = item
                     break
             assert producer_req is not None
             owner = int(producer_req["dst_rank"])  # chosen owner
             # Ask owner to allocate
-            alloc_cmd = ("ALLOCATE", producer_req)
+            alloc_cmd = producer_req
         else:
             alloc_cmd = None
         # Broadcast alloc request to all; owner will act upon it
         alloc_cmd = self._broadcast_one(alloc_cmd, src=self.master_rank)
 
         # OWNER executes allocation and returns plan to master
-        if alloc_cmd is not None and alloc_cmd[0] == "ALLOCATE":
-            payload = alloc_cmd[1]
-            if self.rank == int(payload["dst_rank"]):
-                header_ptr, payload_ptr, page_elems = self._owner_alloc(payload["key"], payload["n_elems"])
+        if alloc_cmd is not None:
+            if self.rank == int(alloc_cmd["dst_rank"]):
+                header_ptr, payload_ptr, page_elems = self._owner_alloc(alloc_cmd["key_hash"], alloc_cmd["n_elems"])
                 plan = WritePlan(
-                    key_hash=payload["key_hash"],
+                    key_hash=alloc_cmd["key_hash"],
                     dst_rank=self.rank,
                     header_ptr=header_ptr,
                     payload_ptr=payload_ptr,
-                    n_elems=payload["n_elems"],
+                    n_elems=alloc_cmd["n_elems"],
                     page_elems=page_elems,
                     dtype=self.dtype,
                 )
@@ -276,17 +268,14 @@ class NanoKVCache:
             plan = None
 
         # Gather plan from all to master
-        plans = self._all_gather_one(("PLAN", plan))
+        plans = self._all_gather_one(plan)
 
         # Master selects owner's plan, stores metadata, then broadcasts final plan
         if self.rank == self.master_rank:
             owner_plan: Optional[WritePlan] = None
             for item in plans:
-                if item is None:
-                    continue
-                tag, p = item
-                if tag == "PLAN" and p is not None:
-                    owner_plan = p
+                if item is not None:
+                    owner_plan = item
                     break
             assert owner_plan is not None
             # Persist meta
@@ -301,13 +290,11 @@ class NanoKVCache:
                 dtype=self.dtype,
             )
             self._index[key_hash] = meta
-            final = ("PLAN_FINAL", owner_plan)
+            final = owner_plan
         else:
             final = None
 
-        owner_plan = self._broadcast_one(final, src=self.master_rank)
-        assert owner_plan[0] == "PLAN_FINAL"
-        return owner_plan[1]
+        return self._broadcast_one(final, src=self.master_rank)
 
     def commit(self, plan: WritePlan) -> None:
         # Flip header state to READY with release semantics via IRIS atomic_xchg
@@ -345,15 +332,11 @@ class NanoKVCache:
     def get_location(self, key: str) -> Optional[ObjMeta]:
         key_hash = _hash_key_u64(key)
         # Master returns ObjMeta if present
-        req = ("LOC_REQ", {"key_hash": key_hash})
-        gathered = self._all_gather_one(req)
         if self.rank == self.master_rank:
             meta = self._index.get(key_hash)
-            resp = ("LOC_RESP", meta)
         else:
-            resp = None
-        meta = self._broadcast_one(resp, src=self.master_rank)
-        return meta[1]
+            meta = None
+        return self._broadcast_one(meta, src=self.master_rank)
 
     def get_into(self, key: str, dst: torch.Tensor) -> None:
         assert dst.is_cuda and dst.dtype == self.dtype and dst.is_contiguous()
@@ -387,38 +370,32 @@ class NanoKVCache:
 
     def remove(self, key: str) -> None:
         key_hash = _hash_key_u64(key)
-        req = ("REM_REQ", {"key_hash": key_hash})
-        gathered = self._all_gather_one(req)
         if self.rank == self.master_rank:
             meta = self._index.get(key_hash)
             if meta is None:
-                resp = ("REM_RESP", False)
+                resp = None
             else:
                 # OWNER sets STATE=DEAD locally
-                resp = ("REM_DO", meta)
+                resp = meta
         else:
             resp = None
         resp = self._broadcast_one(resp, src=self.master_rank)
 
-        if resp[0] == "REM_DO":
-            meta: ObjMeta = resp[1]
+        if resp is not None:
+            meta: ObjMeta = resp
             if self.rank == meta.owner_rank:
                 header = self._headers.get(key_hash)
                 if header is not None:
                     header[OFF_STATE] = STATE_DEAD
                     torch.cuda.synchronize()
-                ok = True
-            else:
-                ok = True
             # Inform master of completion
-            fin = ("REM_DONE", ok, key_hash)
+            fin = key_hash
         else:
-            fin = resp
+            fin = None
         fins = self._all_gather_one(fin)
         if self.rank == self.master_rank:
-            for tag, *rest in fins:
-                if tag == "REM_DONE":
-                    _, _, kh = (tag, *rest)
+            for kh in fins:
+                if kh is not None:
                     self._index.pop(kh, None)
 
     def stats(self) -> Dict[str, Any]:
