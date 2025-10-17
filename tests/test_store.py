@@ -179,4 +179,3 @@ def test_remove_waits_for_reader(cli, owner):
     assert cli.remove(man.hash, owner) is False  # busy
     owner.reader_exit(man)
     assert cli.remove(man.hash, owner) is True
-
