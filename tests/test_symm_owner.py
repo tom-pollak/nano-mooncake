@@ -1,8 +1,10 @@
 import os
 import sys
+import uuid
 
 import torch
 import torch.distributed as dist
+import etcd3
 from torch.testing._internal.common_distributed import (
     MultiProcessTestCase,
     skip_if_lt_x_gpu,
@@ -12,7 +14,7 @@ from torch.testing._internal.common_utils import run_tests
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from nano_mooncake.owner import Owner
-from nano_mooncake.store import Manifest
+from nano_mooncake.store import Client
 
 
 class SymmetricOwnerSmokeTest(MultiProcessTestCase):
@@ -52,24 +54,32 @@ class SymmetricOwnerSmokeTest(MultiProcessTestCase):
         except ValueError:
             self.skipTest("PyTorch symmetric memory not available")
 
-        manifest_json = [None]
+        ns = [None]
         if self.rank == 0:
-            man = owner.alloc("sess/test", bytes_total=512, epoch=1)
-            pattern = torch.arange(
-                man.bytes_total, dtype=torch.uint8, device=self.device
-            ) % 251
-            owner.payload_view(man, dtype=torch.uint8).copy_(pattern)
-            manifest_json[0] = man.model_dump_json()
+            ns[0] = f"/nm_symm/{uuid.uuid4().hex}"
+        dist.broadcast_object_list(ns, src=0)
+        prefix = ns[0]
 
-        dist.broadcast_object_list(manifest_json, src=0)
-        assert manifest_json[0] is not None
-        man = Manifest.model_validate_json(manifest_json[0])
+        cli = etcd3.client()
+        store = Client(cli, prefix)
+
+        key = "sess/test"
+        pattern = torch.arange(512, dtype=torch.uint8, device=self.device) % 251
+        dist.barrier()
+
+        if self.rank == 0:
+            store.put_tensor(owner, key, pattern, epoch=1)
 
         dist.barrier()
-        payload = owner.payload_view(man, dtype=torch.uint8).cpu()
-        expected = torch.arange(man.bytes_total, dtype=torch.uint8) % 251
+        payload = store.get_tensor(owner, key).cpu()
+        expected = torch.arange(512, dtype=torch.uint8) % 251
         torch.testing.assert_close(payload, expected)
+
         dist.barrier()
+        if self.rank == 0:
+            store.remove(store.key_hash(key), owner)
+            for k, *_ in cli.get_prefix(prefix):
+                cli.delete(k)
 
         dist.destroy_process_group()
 
